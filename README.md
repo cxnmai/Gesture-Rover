@@ -35,6 +35,33 @@ Quick sanity check (no webcam / no GUI needed):
 python steering_wheel_tracker.py --self-test
 ```
 
+## 3) Finger count -> Arduino LEDs
+
+This sends the detected finger count to an Arduino Uno over Serial.
+
+Arduino sketch:
+
+- `arduino/finger_led_serial/finger_led_serial.ino`
+
+Upload with Arduino CLI (example):
+
+```bash
+arduino-cli compile --fqbn arduino:avr:uno arduino/finger_led_serial
+arduino-cli upload --fqbn arduino:avr:uno --port /dev/ttyACM0 arduino/finger_led_serial
+```
+
+Run the Python sender:
+
+```bash
+python finger_to_arduino.py --port /dev/ttyACM0
+```
+
+Behavior:
+
+- 0 fingers: LED off
+- 1 finger: `L` (pin 13) on
+- 2+ fingers: `L` on + TX LED stays (mostly) on via periodic Serial writes
+
 - Hold both hands like you are gripping a steering wheel.
 - The program estimates rotation angle (degrees) and direction (`left`/`right`).
 - It auto-calibrates once you hold the wheel level for a moment.
