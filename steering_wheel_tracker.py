@@ -36,7 +36,9 @@ HAND_CONNECTIONS = [
     (0, 17),
 ]
 
-PALM_LANDMARKS = [0, 5, 9, 13, 17]  # wrist + MCPs
+# Points around the back-of-fist / knuckle area.
+# Using MCPs (knuckles) gives a more stable "grip point" than including the wrist.
+GRIP_LANDMARKS = [5, 9, 13, 17]  # index/middle/ring/pinky MCP
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -80,11 +82,21 @@ def draw_hand(frame, hand_landmarks) -> None:
         cv2.circle(frame, (x, y), 3, (255, 255, 255), -1, cv2.LINE_AA)
 
 
-def palm_center_px(hand_landmarks, w: int, h: int) -> tuple[int, int]:
-    xs = [hand_landmarks[i].x for i in PALM_LANDMARKS]
-    ys = [hand_landmarks[i].y for i in PALM_LANDMARKS]
-    cx = int(np.clip(float(np.mean(xs)), 0.0, 1.0) * w)
-    cy = int(np.clip(float(np.mean(ys)), 0.0, 1.0) * h)
+def grip_point_px(hand_landmarks, w: int, h: int) -> tuple[int, int]:
+    """Approximate where the fist would grip an imaginary wheel.
+
+    We use the knuckle (MCP) cluster and bias slightly toward the middle knuckle.
+    """
+
+    xs = [hand_landmarks[i].x for i in GRIP_LANDMARKS]
+    ys = [hand_landmarks[i].y for i in GRIP_LANDMARKS]
+
+    # Bias toward middle MCP (9) for a steadier grip point.
+    x = float(np.mean(xs) * 0.65 + hand_landmarks[9].x * 0.35)
+    y = float(np.mean(ys) * 0.65 + hand_landmarks[9].y * 0.35)
+
+    cx = int(np.clip(x, 0.0, 1.0) * w)
+    cy = int(np.clip(y, 0.0, 1.0) * h)
     return cx, cy
 
 
@@ -176,7 +188,8 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit(f"Could not open webcam (index {args.camera})")
 
-    baseline = None  # unwrapped angle baseline
+    # Horizontal should always mean 0 degrees (no explicit calibration).
+    # We still smooth and unwrap angles to avoid jitter and +/-180 flipping.
     smooth = deque(maxlen=7)
     prev_raw = None
     unwrap_offset = 0.0
@@ -196,16 +209,11 @@ def main() -> None:
         ts_ms = int(time.time() * 1000)
         result = landmarker.detect_for_video(mp_image, ts_ms)
 
-        centers_by_label = {}
-        if result.hand_landmarks and result.handedness:
+        centers = []
+        if result.hand_landmarks:
             for idx, hand_lms in enumerate(result.hand_landmarks):
-                label = result.handedness[idx][0].category_name  # Left/Right
-                score = result.handedness[idx][0].score
-                center = palm_center_px(hand_lms, w, h)
-
-                # Keep the most confident instance per label.
-                if label not in centers_by_label or score > centers_by_label[label][0]:
-                    centers_by_label[label] = (score, center)
+                center = grip_point_px(hand_lms, w, h)
+                centers.append(center)
 
                 if not args.no_gui:
                     draw_hand(frame, hand_lms)
@@ -213,10 +221,11 @@ def main() -> None:
         msg = "Show two hands like a steering wheel"
         angle_out = None
 
-        if "Left" in centers_by_label and "Right" in centers_by_label:
+        if len(centers) >= 2:
             missing_frames = 0
-            left_c = centers_by_label["Left"][1]
-            right_c = centers_by_label["Right"][1]
+            # Use screen left/right positions so horizontal is always 0 deg.
+            centers.sort(key=lambda p: p[0])
+            left_c, right_c = centers[0], centers[-1]
 
             raw = angle_deg_from_centers(left_c, right_c)  # (-180, 180]
 
@@ -231,47 +240,54 @@ def main() -> None:
 
             unwrapped = raw + unwrap_offset
 
-            if baseline is None:
-                smooth.append(unwrapped)
-                if len(smooth) == smooth.maxlen:
-                    baseline = float(np.mean(smooth))
-            else:
-                smooth.append(unwrapped)
+            smooth.append(unwrapped)
+            filtered = float(np.mean(smooth))
+            angle_out = filtered
 
-            if baseline is not None and smooth:
-                filtered = float(np.mean(smooth))
-                angle_out = float(filtered - baseline)
+            direction = "center"
+            if angle_out > 3:
+                direction = "right"
+            elif angle_out < -3:
+                direction = "left"
 
-                direction = "center"
-                if angle_out > 3:
-                    direction = "right"
-                elif angle_out < -3:
-                    direction = "left"
-
-                msg = f"Steering: {abs(angle_out):.1f} deg {direction}"
+            msg = f"Steering: {abs(angle_out):.1f} deg {direction}"
 
             if not args.no_gui:
                 cv2.line(frame, left_c, right_c, (0, 255, 0), 4, cv2.LINE_AA)
                 cv2.circle(frame, left_c, 8, (255, 255, 255), -1, cv2.LINE_AA)
                 cv2.circle(frame, right_c, 8, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    "L grip",
+                    (left_c[0] - 30, left_c[1] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    "R grip",
+                    (right_c[0] - 30, right_c[1] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
         else:
             missing_frames += 1
-            if missing_frames > 30:
-                # If tracking is lost for a bit, reset unwrap state so we don't
-                # accumulate a large, incorrect offset when hands reappear.
+            if missing_frames > 10:
+                smooth.clear()
                 prev_raw = None
                 unwrap_offset = 0.0
 
         if args.no_gui:
             now = time.time()
-            if baseline is None:
-                if (now - last_print) > 1.0:
-                    print("Calibrating... hold wheel level")
-                    last_print = now
-            else:
-                if angle_out is not None and (now - last_print) > 0.25:
-                    print(msg)
-                    last_print = now
+            if angle_out is not None and (now - last_print) > 0.25:
+                print(msg)
+                last_print = now
             continue
 
         cv2.putText(
@@ -285,30 +301,18 @@ def main() -> None:
             cv2.LINE_AA,
         )
 
-        if baseline is None:
-            cv2.putText(
-                frame,
-                "Calibrating... hold wheel level",
-                (10, 64),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        else:
-            cv2.putText(
-                frame,
-                "c: re-calibrate | q: quit",
-                (10, frame.shape[0] - 12),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+        cv2.putText(
+            frame,
+            "q: quit",
+            (10, frame.shape[0] - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
-        # Steering wheel overlay (always draw; angle 0 while calibrating)
+        # Steering wheel overlay (reset to 0 when hands not detected)
         wheel_angle = 0.0 if angle_out is None else float(angle_out)
         wheel_center = (frame.shape[1] - 150, frame.shape[0] - 150)
         draw_steering_wheel(frame, wheel_center, radius=110, angle_deg=wheel_angle)
@@ -318,21 +322,6 @@ def main() -> None:
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
-        if key == ord("c") and ("Left" in centers_by_label and "Right" in centers_by_label):
-            left_c = centers_by_label["Left"][1]
-            right_c = centers_by_label["Right"][1]
-            raw = angle_deg_from_centers(left_c, right_c)
-
-            # Update unwrap state then set baseline on the unwrapped value.
-            if prev_raw is not None:
-                diff = raw - prev_raw
-                if diff > 180.0:
-                    unwrap_offset -= 360.0
-                elif diff < -180.0:
-                    unwrap_offset += 360.0
-            prev_raw = raw
-            baseline = float(raw + unwrap_offset)
-            smooth.clear()
 
     cap.release()
     if not args.no_gui:
