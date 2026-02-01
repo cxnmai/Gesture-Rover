@@ -191,10 +191,15 @@ def main() -> None:
     # Horizontal should always mean 0 degrees (no explicit calibration).
     # We still smooth and unwrap angles to avoid jitter and +/-180 flipping.
     smooth = deque(maxlen=7)
+    # Hand separation tracking: calibrated to user's "neutral" wheel width.
+    dist_filter = deque(maxlen=7)
+    dist_calib = deque(maxlen=15)
+    baseline_dist = None
     prev_raw = None
     unwrap_offset = 0.0
     missing_frames = 0
     last_print = 0.0
+    last_angle_out = 0.0
 
     while True:
         ok, frame = cap.read()
@@ -209,25 +214,59 @@ def main() -> None:
         ts_ms = int(time.time() * 1000)
         result = landmarker.detect_for_video(mp_image, ts_ms)
 
-        centers = []
-        if result.hand_landmarks:
+        centers_by_label = {}
+        if result.hand_landmarks and result.handedness:
             for idx, hand_lms in enumerate(result.hand_landmarks):
+                label = result.handedness[idx][0].category_name  # Left/Right (image)
+                score = float(result.handedness[idx][0].score)
                 center = grip_point_px(hand_lms, w, h)
-                centers.append(center)
+
+                # We process a mirrored frame for user-friendly display.
+                # Mirroring swaps image-handedness, so flip labels back.
+                if label == "Left":
+                    label = "Right"
+                elif label == "Right":
+                    label = "Left"
+
+                # Keep the most confident instance per label.
+                if label not in centers_by_label or score > centers_by_label[label][0]:
+                    centers_by_label[label] = (score, center)
 
                 if not args.no_gui:
                     draw_hand(frame, hand_lms)
 
         msg = "Show two hands like a steering wheel"
         angle_out = None
+        dist_px = 0.0
+        dist_ratio = 0.0
+        dist_note = ""
 
-        if len(centers) >= 2:
+        if "Left" in centers_by_label and "Right" in centers_by_label:
             missing_frames = 0
-            # Use screen left/right positions so horizontal is always 0 deg.
-            centers.sort(key=lambda p: p[0])
-            left_c, right_c = centers[0], centers[-1]
+            # Use per-hand identity so the angle can exceed 90 degrees.
+            left_c = centers_by_label["Left"][1]
+            right_c = centers_by_label["Right"][1]
+
+            dist_px_raw = float(math.hypot(right_c[0] - left_c[0], right_c[1] - left_c[1]))
+            dist_filter.append(dist_px_raw)
+            dist_px = float(np.mean(dist_filter))
+
+            if baseline_dist is None:
+                dist_calib.append(dist_px)
+                if len(dist_calib) == dist_calib.maxlen:
+                    baseline_dist = float(np.mean(dist_calib))
+                else:
+                    dist_note = "(calibrating width)"
+            if baseline_dist is not None and baseline_dist > 1e-6:
+                dist_ratio = dist_px / baseline_dist
 
             raw = angle_deg_from_centers(left_c, right_c)  # (-180, 180]
+
+            # If we previously lost tracking and cleared unwrap state, align the
+            # unwrap branch so the angle stays continuous when hands reappear.
+            if prev_raw is None and not smooth:
+                k = int(round((last_angle_out - raw) / 360.0))
+                unwrap_offset = 360.0 * k
 
             # Unwrap to allow continuous rotation past +/-180.
             if prev_raw is not None:
@@ -243,6 +282,7 @@ def main() -> None:
             smooth.append(unwrapped)
             filtered = float(np.mean(smooth))
             angle_out = filtered
+            last_angle_out = float(angle_out)
 
             direction = "center"
             if angle_out > 3:
@@ -251,6 +291,10 @@ def main() -> None:
                 direction = "left"
 
             msg = f"Steering: {abs(angle_out):.1f} deg {direction}"
+            if baseline_dist is not None:
+                msg += f" | Width: {dist_ratio:.2f}x"
+            else:
+                msg += f" | Width: -- {dist_note}".rstrip()
 
             if not args.no_gui:
                 cv2.line(frame, left_c, right_c, (0, 255, 0), 4, cv2.LINE_AA)
@@ -280,13 +324,27 @@ def main() -> None:
             missing_frames += 1
             if missing_frames > 10:
                 smooth.clear()
+                dist_filter.clear()
                 prev_raw = None
                 unwrap_offset = 0.0
 
+            # Hold the last known steering angle when hands are not visible.
+            hold_dir = "center"
+            if last_angle_out > 3:
+                hold_dir = "right"
+            elif last_angle_out < -3:
+                hold_dir = "left"
+            msg = f"Steering: {abs(last_angle_out):.1f} deg {hold_dir} | Width: 0"
+
         if args.no_gui:
             now = time.time()
-            if angle_out is not None and (now - last_print) > 0.25:
-                print(msg)
+            if (now - last_print) > 0.25:
+                if angle_out is None:
+                    print(f"Steering: {last_angle_out:.1f} deg | Width: 0")
+                elif baseline_dist is None:
+                    print(f"Steering: {angle_out:.1f} deg | Width: --")
+                else:
+                    print(f"Steering: {angle_out:.1f} deg | Width: {dist_ratio:.2f}x")
                 last_print = now
             continue
 
@@ -312,16 +370,49 @@ def main() -> None:
             cv2.LINE_AA,
         )
 
-        # Steering wheel overlay (reset to 0 when hands not detected)
-        wheel_angle = 0.0 if angle_out is None else float(angle_out)
+        # Steering wheel overlay: hold last angle when hands not detected.
+        wheel_angle = float(last_angle_out) if angle_out is None else float(angle_out)
         wheel_center = (frame.shape[1] - 150, frame.shape[0] - 150)
         draw_steering_wheel(frame, wheel_center, radius=110, angle_deg=wheel_angle)
+
+        # Distance HUD
+        if baseline_dist is None:
+            dist_line = f"Wheel width: calibrating ({len(dist_calib)}/{dist_calib.maxlen})"
+        else:
+            dist_line = f"Wheel width: {dist_ratio:.2f}x  ({dist_px:.0f}px)"
+        if angle_out is None:
+            dist_line = "Wheel width: 0"
+        cv2.putText(
+            frame,
+            dist_line,
+            (10, 64),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            "r: recal width",
+            (10, frame.shape[0] - 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
         cv2.imshow("Steering Wheel Tracker", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord("r"):
+            baseline_dist = None
+            dist_calib.clear()
+            dist_filter.clear()
 
     cap.release()
     if not args.no_gui:
