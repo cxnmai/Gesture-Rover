@@ -39,6 +39,8 @@ HAND_CONNECTIONS = [
 # Points around the back-of-fist / knuckle area.
 # Using MCPs (knuckles) gives a more stable "grip point" than including the wrist.
 GRIP_LANDMARKS = [5, 9, 13, 17]  # index/middle/ring/pinky MCP
+MID_FINGER_TIP = 12
+WRIST = 0
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -116,6 +118,38 @@ def angle_deg_from_centers(left: tuple[int, int], right: tuple[int, int]) -> flo
     return math.degrees(math.atan2(dy, dx))
 
 
+def hand_orientation_upright(hand_landmarks) -> tuple[str, float]:
+    """Classify hand as upright vs upside down in image coordinates.
+
+    We approximate the "up" direction of a hand by the vector wrist -> middle
+    fingertip. In a typical upright hand (fingers pointing up), the fingertip is
+    above the wrist (smaller y). For an upside-down hand (fingers pointing down),
+    the fingertip is below the wrist (larger y).
+
+    Returns:
+      (label, confidence)
+        label: "upright", "upside_down", or "unknown" (when the hand is mostly sideways)
+        confidence: 0..1, based on how vertical the wrist->tip vector is.
+    """
+
+    wrist = hand_landmarks[WRIST]
+    tip = hand_landmarks[MID_FINGER_TIP]
+
+    dx = float(tip.x - wrist.x)
+    dy = float(tip.y - wrist.y)
+    mag = float(math.hypot(dx, dy))
+    if mag < 1e-6:
+        return "unknown", 0.0
+
+    # 1.0 = perfectly vertical, 0.0 = perfectly horizontal.
+    verticality = abs(dy) / mag
+    if verticality < 0.35:
+        return "unknown", verticality
+
+    # y increases downward in image coordinates.
+    return ("upright", verticality) if dy < 0.0 else ("upside_down", verticality)
+
+
 def draw_steering_wheel(
     frame,
     center: tuple[int, int],
@@ -162,6 +196,16 @@ def draw_steering_wheel(
     cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
 
 
+def wrap_deg_180(angle_deg: float) -> float:
+    """Wrap an angle to [-180, 180) degrees.
+
+    This keeps the displayed steering angle pinned around 0 degrees, so crossing
+    a 360-degree period does not show values like 360.
+    """
+
+    return ((float(angle_deg) + 180.0) % 360.0) - 180.0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
@@ -200,6 +244,12 @@ def main() -> None:
     missing_frames = 0
     last_print = 0.0
     last_angle_out = 0.0
+    last_angle_unwrapped = 0.0
+
+    # Per-hand orientation smoothing (upright vs upside down).
+    # Votes: +1 = upright, -1 = upside down, 0 = unknown/sideways.
+    ori_votes = {"Left": deque(maxlen=9), "Right": deque(maxlen=9)}
+    last_ori = {"Left": "unknown", "Right": "unknown"}
 
     while True:
         ok, frame = cap.read()
@@ -230,7 +280,7 @@ def main() -> None:
 
                 # Keep the most confident instance per label.
                 if label not in centers_by_label or score > centers_by_label[label][0]:
-                    centers_by_label[label] = (score, center)
+                    centers_by_label[label] = (score, center, hand_lms)
 
                 if not args.no_gui:
                     draw_hand(frame, hand_lms)
@@ -240,6 +290,28 @@ def main() -> None:
         dist_px = 0.0
         dist_ratio = 0.0
         dist_note = ""
+        reversing = False
+        width_out = "0"
+
+        # Update per-hand orientation trackers from the best detections we kept.
+        for label in ("Left", "Right"):
+            if label not in centers_by_label:
+                continue
+            _, _, lms = centers_by_label[label]
+            ori, conf = hand_orientation_upright(lms)
+            if ori == "upright" and conf >= 0.35:
+                ori_votes[label].append(1)
+            elif ori == "upside_down" and conf >= 0.35:
+                ori_votes[label].append(-1)
+            else:
+                ori_votes[label].append(0)
+
+            s = sum(ori_votes[label])
+            if abs(s) >= 2:
+                last_ori[label] = "upright" if s > 0 else "upside_down"
+            elif len(ori_votes[label]) == ori_votes[label].maxlen:
+                # If we have enough history but no strong signal, mark unknown.
+                last_ori[label] = "unknown"
 
         if "Left" in centers_by_label and "Right" in centers_by_label:
             missing_frames = 0
@@ -260,12 +332,17 @@ def main() -> None:
             if baseline_dist is not None and baseline_dist > 1e-6:
                 dist_ratio = dist_px / baseline_dist
 
+            if baseline_dist is None:
+                width_out = f"cal {len(dist_calib)}/{dist_calib.maxlen}"
+            else:
+                width_out = f"{dist_ratio:.2f}x"
+
             raw = angle_deg_from_centers(left_c, right_c)  # (-180, 180]
 
             # If we previously lost tracking and cleared unwrap state, align the
             # unwrap branch so the angle stays continuous when hands reappear.
             if prev_raw is None and not smooth:
-                k = int(round((last_angle_out - raw) / 360.0))
+                k = int(round((last_angle_unwrapped - raw) / 360.0))
                 unwrap_offset = 360.0 * k
 
             # Unwrap to allow continuous rotation past +/-180.
@@ -281,20 +358,17 @@ def main() -> None:
 
             smooth.append(unwrapped)
             filtered = float(np.mean(smooth))
-            angle_out = filtered
+            last_angle_unwrapped = float(filtered)
+            angle_out = wrap_deg_180(filtered)
             last_angle_out = float(angle_out)
 
-            direction = "center"
-            if angle_out > 3:
-                direction = "right"
-            elif angle_out < -3:
-                direction = "left"
+            reversing = (
+                abs(angle_out) > 160.0
+                and last_ori["Left"] == "upright"
+                and last_ori["Right"] == "upright"
+            )
 
-            msg = f"Steering: {abs(angle_out):.1f} deg {direction}"
-            if baseline_dist is not None:
-                msg += f" | Width: {dist_ratio:.2f}x"
-            else:
-                msg += f" | Width: -- {dist_note}".rstrip()
+            msg = f"deg {angle_out:.1f} | w {width_out} | reversing {reversing}"
 
             if not args.no_gui:
                 cv2.line(frame, left_c, right_c, (0, 255, 0), 4, cv2.LINE_AA)
@@ -327,24 +401,19 @@ def main() -> None:
                 dist_filter.clear()
                 prev_raw = None
                 unwrap_offset = 0.0
+                ori_votes["Left"].clear()
+                ori_votes["Right"].clear()
+                last_ori["Left"] = "unknown"
+                last_ori["Right"] = "unknown"
 
-            # Hold the last known steering angle when hands are not visible.
-            hold_dir = "center"
-            if last_angle_out > 3:
-                hold_dir = "right"
-            elif last_angle_out < -3:
-                hold_dir = "left"
-            msg = f"Steering: {abs(last_angle_out):.1f} deg {hold_dir} | Width: 0"
+            width_out = "0"
+            msg = f"deg {last_angle_out:.1f} | w {width_out} | reversing {reversing}"
 
         if args.no_gui:
             now = time.time()
             if (now - last_print) > 0.25:
-                if angle_out is None:
-                    print(f"Steering: {last_angle_out:.1f} deg | Width: 0")
-                elif baseline_dist is None:
-                    print(f"Steering: {angle_out:.1f} deg | Width: --")
-                else:
-                    print(f"Steering: {angle_out:.1f} deg | Width: {dist_ratio:.2f}x")
+                out_deg = last_angle_out if angle_out is None else angle_out
+                print(f"deg {out_deg:.1f} w {width_out} reversing {reversing}")
                 last_print = now
             continue
 
@@ -354,14 +423,14 @@ def main() -> None:
             (10, 32),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.9,
-            (0, 255, 255) if angle_out is None else (0, 255, 0),
+            (0, 0, 255) if reversing else ((0, 255, 255) if angle_out is None else (0, 255, 0)),
             2,
             cv2.LINE_AA,
         )
 
         cv2.putText(
             frame,
-            "q: quit",
+            "q quit",
             (10, frame.shape[0] - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -375,27 +444,11 @@ def main() -> None:
         wheel_center = (frame.shape[1] - 150, frame.shape[0] - 150)
         draw_steering_wheel(frame, wheel_center, radius=110, angle_deg=wheel_angle)
 
-        # Distance HUD
-        if baseline_dist is None:
-            dist_line = f"Wheel width: calibrating ({len(dist_calib)}/{dist_calib.maxlen})"
-        else:
-            dist_line = f"Wheel width: {dist_ratio:.2f}x  ({dist_px:.0f}px)"
-        if angle_out is None:
-            dist_line = "Wheel width: 0"
-        cv2.putText(
-            frame,
-            dist_line,
-            (10, 64),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+
 
         cv2.putText(
             frame,
-            "r: recal width",
+            "r recal",
             (10, frame.shape[0] - 36),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
