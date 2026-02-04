@@ -23,3 +23,6 @@ Thumbs.db
 
 # MediaPipe model assets
 models/*.task
+
+# schematics stuff (prob scrapped)
+car_schematic/

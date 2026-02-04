@@ -2,11 +2,13 @@
 // Receives a newline-terminated integer over Serial:
 //   0 = no LEDs
 //   1 = LED_BUILTIN (L) on
-//   2 = LED_BUILTIN on + keep TX LED "on" by periodic writes
+//   2 = LED_BUILTIN on + D4 HIGH
 //
 // Note: The Uno only has one user-controllable onboard LED (L). The TX LED is
 // driven by serial transmit activity; we approximate a second LED by sending
 // periodic bytes when level==2.
+
+static const int PIN_D4 = 4;
 
 static int level = 0;
 static unsigned long last_rx_ms = 0;
@@ -43,6 +45,9 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
+  pinMode(PIN_D4, OUTPUT);
+  digitalWrite(PIN_D4, LOW);
+
   Serial.begin(115200);
   last_rx_ms = millis();
   last_tx_ms = millis();
@@ -63,6 +68,7 @@ void loop() {
   }
 
   digitalWrite(LED_BUILTIN, (level >= 1) ? HIGH : LOW);
+  digitalWrite(PIN_D4, (level >= 2) ? HIGH : LOW);
 
   // Keep TX LED lit (approximately) by transmitting periodically.
   if (level >= 2) {
