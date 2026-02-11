@@ -21,6 +21,10 @@ Thumbs.db
 *.swp
 *.swo
 
+# Local secrets
+.env
+esp32/secrets.h
+
 # MediaPipe model assets
 models/*.task
 
