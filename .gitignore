@@ -26,3 +26,7 @@ models/*.task
 
 # schematics stuff (prob scrapped)
 car_schematic/
+
+# Rust (avr firmware)
+rust-arduino/target/
+rust-arduino/*.hex
