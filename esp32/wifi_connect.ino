@@ -1,29 +1,23 @@
-// Minimal ESP32 WiFi connect sketch (Arduino framework)
-// Upload with Arduino IDE / arduino-cli.
-
 #include <WiFi.h>
-
-// Option A (recommended): define WIFI_SSID / WIFI_PASSWORD via build flags or a local secrets.h.
-// Option B: edit the fallback strings below.
-//
-// Example secrets.h (do not commit):
-//   #define WIFI_SSID "MyNetwork"
-//   #define WIFI_PASSWORD "MyPassword"
+#include <WiFiUdp.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
 
 #ifndef WIFI_SSID
-#define WIFI_SSID "YOUR_SSID"
+#define WIFI_SSID "Chinmay iPhone"
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "YOUR_PASSWORD"
+#define WIFI_PASSWORD "password"
 #endif
 
 static const char *kSsid = WIFI_SSID;
 static const char *kPassword = WIFI_PASSWORD;
+static const uint16_t kUdpPort = 4210;
+
+WiFiUDP udp;
 
 static void connect_wifi() {
   WiFi.mode(WIFI_STA);
@@ -37,24 +31,16 @@ static void connect_wifi() {
 
   WiFi.begin(kSsid, kPassword);
 
-  const unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(250);
     Serial.print('.');
   }
   Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("wifi ok ip=");
-    Serial.println(WiFi.localIP());
-    Serial.print("wifi rssi=");
-    Serial.println(WiFi.RSSI());
-    return;
-  }
-
-  Serial.println("wifi failed; retrying");
-  WiFi.disconnect(true /*wifioff*/);
-  delay(500);
+  Serial.print("wifi ok ip=");
+  Serial.println(WiFi.localIP());
+  Serial.print("wifi rssi=");
+  Serial.println(WiFi.RSSI());
 }
 
 void setup() {
@@ -62,20 +48,40 @@ void setup() {
   delay(200);
 
   connect_wifi();
+  udp.begin(kUdpPort);
+  Serial.print("udp listen port=");
+  Serial.println(kUdpPort);
 }
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connect_wifi();
+    udp.begin(kUdpPort);
     return;
   }
 
-  static unsigned long last = 0;
-  if (millis() - last >= 5000) {
-    last = millis();
-    Serial.print("ip ");
-    Serial.print(WiFi.localIP());
-    Serial.print(" rssi ");
-    Serial.println(WiFi.RSSI());
+  int packetSize = udp.parsePacket();
+  if (packetSize <= 0) {
+    delay(5);
+    return;
   }
+
+  char buffer[256];
+  int n = udp.read(buffer, sizeof(buffer) - 1);
+  if (n < 0) {
+    return;
+  }
+  buffer[n] = '\0';
+
+  Serial.print("rx ");
+  Serial.print(udp.remoteIP());
+  Serial.print(":");
+  Serial.print(udp.remotePort());
+  Serial.print(" ");
+  Serial.println(buffer);
+
+  udp.beginPacket(udp.remoteIP(), udp.remotePort());
+  udp.print("ACK:");
+  udp.print(buffer);
+  udp.endPacket();
 }
