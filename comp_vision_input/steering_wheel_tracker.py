@@ -10,6 +10,7 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
+from cv_to_packet import WheelState, width_angle_to_packet, width_angle_to_wheels
 
 
 HAND_CONNECTIONS = [
@@ -206,6 +207,30 @@ def wrap_deg_180(angle_deg: float) -> float:
     return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
 
+def describe_motion(left: WheelState, right: WheelState) -> str:
+    if left.speed == 0 and right.speed == 0:
+        return "braking/stop"
+
+    left_dir = -1 if left.reverse else 1
+    right_dir = -1 if right.reverse else 1
+
+    if left_dir != right_dir:
+        return "pivot in place (opposite wheel directions)"
+
+    direction = "forward" if left_dir > 0 else "reverse"
+    if left.speed == right.speed:
+        return f"{direction} straight"
+
+    faster = "left" if left.speed > right.speed else "right"
+    return f"{direction} arc ({faster} wheel faster)"
+
+
+def wheel_detail(left: WheelState, right: WheelState) -> str:
+    left_mode = "REV" if left.reverse else ("STOP" if left.speed == 0 else "FWD")
+    right_mode = "REV" if right.reverse else ("STOP" if right.speed == 0 else "FWD")
+    return f"L {left_mode} {left.speed:03d} | R {right_mode} {right.speed:03d}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
@@ -289,6 +314,9 @@ def main() -> None:
         dist_ratio = 0.0
         reversing = False
         width_out = "0"
+        packet = "00000000"
+        motion_text = "braking/stop"
+        wheel_text = "L STOP 000 | R STOP 000"
 
         # Update per-hand orientation trackers from the best detections we kept.
         for label in ("Left", "Right"):
@@ -396,11 +424,21 @@ def main() -> None:
             width_out = "0"
             msg = f"deg {last_angle_out:.1f} | w {width_out} | reversing {reversing}"
 
+        packet_angle = float(last_angle_out) if angle_out is None else float(angle_out)
+        packet_width = dist_ratio if ("Left" in centers_by_label and "Right" in centers_by_label) else 0.0
+        left_w, right_w = width_angle_to_wheels(packet_width, packet_angle)
+        packet = width_angle_to_packet(packet_width, packet_angle)
+        motion_text = describe_motion(left_w, right_w)
+        wheel_text = wheel_detail(left_w, right_w)
+
         if args.no_gui:
             now = time.time()
-            if (now - last_print) > 0.25:
+            if (now - last_print) > 0.05:
                 out_deg = last_angle_out if angle_out is None else angle_out
-                print(f"deg {out_deg:.1f} w {width_out} reversing {reversing}")
+                print(
+                    f"deg {out_deg:.1f} w {width_out} reversing {reversing} "
+                    f"pkt {packet} motion {motion_text} [{wheel_text}]"
+                )
                 last_print = now
             continue
 
@@ -422,6 +460,39 @@ def main() -> None:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            f"pkt {packet}",
+            (10, 64),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            motion_text,
+            (10, 92),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            wheel_text,
+            (10, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (220, 220, 220),
             1,
             cv2.LINE_AA,
         )
