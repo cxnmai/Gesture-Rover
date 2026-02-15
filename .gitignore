@@ -27,6 +27,7 @@ esp32/secrets.h
 
 # MediaPipe model assets
 models/*.task
+comp_vision_input/models/*.task
 
 # schematics stuff (prob scrapped)
 car_schematic/
