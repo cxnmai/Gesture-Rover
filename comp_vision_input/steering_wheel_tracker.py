@@ -235,10 +235,8 @@ def main() -> None:
     # Horizontal should always mean 0 degrees (no explicit calibration).
     # We still smooth and unwrap angles to avoid jitter and +/-180 flipping.
     smooth = deque(maxlen=7)
-    # Hand separation tracking: calibrated to user's "neutral" wheel width.
+    # Hand separation tracking in raw screen space (pixel-based).
     dist_filter = deque(maxlen=7)
-    dist_calib = deque(maxlen=15)
-    baseline_dist = None
     prev_raw = None
     unwrap_offset = 0.0
     missing_frames = 0
@@ -289,7 +287,6 @@ def main() -> None:
         angle_out = None
         dist_px = 0.0
         dist_ratio = 0.0
-        dist_note = ""
         reversing = False
         width_out = "0"
 
@@ -322,20 +319,10 @@ def main() -> None:
             dist_px_raw = float(math.hypot(right_c[0] - left_c[0], right_c[1] - left_c[1]))
             dist_filter.append(dist_px_raw)
             dist_px = float(np.mean(dist_filter))
-
-            if baseline_dist is None:
-                dist_calib.append(dist_px)
-                if len(dist_calib) == dist_calib.maxlen:
-                    baseline_dist = float(np.mean(dist_calib))
-                else:
-                    dist_note = "(calibrating width)"
-            if baseline_dist is not None and baseline_dist > 1e-6:
-                dist_ratio = dist_px / baseline_dist
-
-            if baseline_dist is None:
-                width_out = f"cal {len(dist_calib)}/{dist_calib.maxlen}"
-            else:
-                width_out = f"{dist_ratio:.2f}x"
+            # Screen-based scaling:
+            # hands spanning roughly the full frame width ~= 2.00x
+            dist_ratio = float(np.clip((2.0 * dist_px) / max(float(w), 1.0), 0.0, 2.0))
+            width_out = f"{dist_ratio:.2f}x"
 
             raw = angle_deg_from_centers(left_c, right_c)  # (-180, 180]
 
@@ -448,11 +435,11 @@ def main() -> None:
 
         cv2.putText(
             frame,
-            "r recal",
-            (10, frame.shape[0] - 36),
+            "Steering Wheel Tracker",
+            (frame.shape[1] - 190, frame.shape[0] - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
+            0.5,
+            (180, 180, 180),
             1,
             cv2.LINE_AA,
         )
@@ -462,10 +449,6 @@ def main() -> None:
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
-        if key == ord("r"):
-            baseline_dist = None
-            dist_calib.clear()
-            dist_filter.clear()
 
     cap.release()
     if not args.no_gui:
