@@ -1,83 +1,91 @@
 #include <WiFi.h>
 
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
+// Set your Wi-Fi credentials directly here.
+static const char* ssid = "Chinmay iPhone";
+static const char* password = "password";
+static const uint16_t TCP_PORT = 12345;
 
-#ifndef WIFI_SSID
-#define WIFI_SSID "YOUR_SSID"
-#endif
+// ESP32 UART2 pins (edit if your board wiring is different).
+static const int ESP32_UART2_RX = 16;
+static const int ESP32_UART2_TX = 17;
 
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "YOUR_PASSWORD"
-#endif
+static const size_t PACKET_LEN = 8;  // RL + SSS + RR + SSS (ASCII digits)
 
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
-WiFiServer server(12345);
+WiFiServer server(TCP_PORT);
 WiFiClient client;
 
-#if defined(LED_BUILTIN)
-const int LED_PIN = LED_BUILTIN;
-#else
-const int LED_PIN = 2;
-#endif
+char packet_buf[PACKET_LEN];
+size_t packet_pos = 0;
 
-const size_t FRAME_SIZE = 5;  // <Bhh> = reversing_u8, degree_tenths_i16, hand_distance_px_i16
-uint8_t frame_buf[FRAME_SIZE];
-size_t frame_len = 0;
+void connect_wifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(ssid, password);
 
-static int16_t read_i16_le(const uint8_t* ptr) {
-  uint16_t raw = (uint16_t)ptr[0] | ((uint16_t)ptr[1] << 8);
-  return (int16_t)raw;
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
 }
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  Serial.begin(115200);  // USB debug
+  Serial2.begin(115200, SERIAL_8N1, ESP32_UART2_RX, ESP32_UART2_TX);  // To Arduino
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-
+  connect_wifi();
   server.begin();
-  Serial.println("\nCommand Link Ready: " + WiFi.localIP().toString());
+  Serial.print("WiFiServer listening on port ");
+  Serial.println(TCP_PORT);
+}
+
+void handle_byte(uint8_t b) {
+  // Accept only digits for stream alignment.
+  if (b < '0' || b > '9') {
+    packet_pos = 0;
+    return;
+  }
+
+  packet_buf[packet_pos++] = (char)b;
+
+  if (packet_pos == PACKET_LEN) {
+    Serial2.write((uint8_t*)packet_buf, PACKET_LEN);
+    Serial2.write('\n');
+
+    Serial.print("FWD ");
+    for (size_t i = 0; i < PACKET_LEN; ++i) Serial.print(packet_buf[i]);
+    Serial.println();
+
+    packet_pos = 0;
+  }
 }
 
 void loop() {
   if (!client || !client.connected()) {
     client = server.available();
-    frame_len = 0;
-  }
-
-  if (!client || !client.connected()) {
-    delay(5);
-    return;
+    if (client) {
+      packet_pos = 0;
+      Serial.println("Client connected.");
+    } else {
+      delay(5);
+      return;
+    }
   }
 
   while (client.available() > 0) {
-    int b = client.read();
-    if (b < 0) {
-      break;
-    }
-
-    frame_buf[frame_len++] = (uint8_t)b;
-
-    if (frame_len == FRAME_SIZE) {
-      frame_len = 0;
-
-      bool reversing = frame_buf[0] != 0;
-      int16_t degree_tenths = read_i16_le(&frame_buf[1]);
-      int16_t hand_distance_px = read_i16_le(&frame_buf[3]);
-
-      digitalWrite(LED_PIN, reversing ? HIGH : LOW);
-
-      Serial.print("reversing=");
-      Serial.print(reversing ? "T" : "F");
-      Serial.print(" degree=");
-      Serial.print((float)degree_tenths / 10.0f, 1);
-      Serial.print(" hand_distance=");
-      Serial.println(hand_distance_px);
-    }
+    int r = client.read();
+    if (r < 0) break;
+    handle_byte((uint8_t)r);
   }
+
+  if (!client.connected()) {
+    Serial.println("Client disconnected.");
+    packet_pos = 0;
+  }
+
+  yield();
 }

@@ -8,13 +8,13 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from cv_to_packet import width_angle_to_packet
 from steering_wheel_tracker import (
     angle_deg_from_centers,
     create_landmarker,
     draw_hand,
     ensure_model,
     grip_point_px,
-    hand_orientation_upright,
     wrap_deg_180,
 )
 
@@ -28,42 +28,21 @@ def connect_tcp(host: str, port: int, timeout_s: float) -> socket.socket | None:
         return None
 
 
-def transform_signals(reversing: bool, degree: float, hand_distance: float):
-    """TODO: Customize signal transformation before transport.
-
-    Replace this with your own mapping/scaling/quantization logic.
-    Return any structure you want to encode in `build_payload`.
-    """
-    return {
-        "reversing": reversing,
-        "degree": degree,
-        "hand_distance": hand_distance,
-    }
-
-
-def build_payload(transformed) -> bytes:
-    """TODO: Convert transformed data to bytes for socket send.
-
-    Examples you might implement:
-    - fixed-size binary frame
-    - compact CSV
-    - protobuf/cbor/msgpack
-    """
-    _ = transformed
-    return b""
-
-
 def main() -> None:
+    default_model = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.task")
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", required=True, help="ESP32 IP/hostname")
-    ap.add_argument("--port", type=int, default=12345, help="ESP32 TCP port (default: 12345)")
-    ap.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
     ap.add_argument(
-        "--model",
-        default=os.path.join("models", "hand_landmarker.task"),
-        help="Path to hand_landmarker.task",
+        "--host",
+        default="172.20.10.5",
+        help="ESP32 IP/hostname (default: 172.20.10.5)",
     )
-    ap.add_argument("--send-ms", type=int, default=50, help="Send period in ms (default: 50)")
+    ap.add_argument("--port", type=int, default=12345, help="ESP32 WiFiServer port (default: 12345)")
+    ap.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
+    ap.add_argument("--model", default=default_model, help="Path to hand_landmarker.task")
+    ap.add_argument("--frame-width", type=int, default=640, help="Capture width (default: 640)")
+    ap.add_argument("--frame-height", type=int, default=360, help="Capture height (default: 360)")
+    ap.add_argument("--send-ms", type=int, default=20, help="Packet send period in ms (default: 20)")
     ap.add_argument("--connect-timeout", type=float, default=1.0, help="TCP connect timeout seconds")
     ap.add_argument("--no-gui", action="store_true", help="Run without cv2.imshow")
     ap.add_argument("--self-test", action="store_true", help="Load model and exit")
@@ -82,19 +61,20 @@ def main() -> None:
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         raise SystemExit(f"Could not open webcam (index {args.camera})")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(args.frame_width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(args.frame_height))
 
     smooth = deque(maxlen=7)
+    dist_filter = deque(maxlen=7)
     prev_raw = None
     unwrap_offset = 0.0
     missing_frames = 0
     last_angle_out = 0.0
     last_angle_unwrapped = 0.0
 
-    ori_votes = {"Left": deque(maxlen=9), "Right": deque(maxlen=9)}
-    last_ori = {"Left": "unknown", "Right": "unknown"}
-
     sock = None
     last_connect_try = 0.0
+    last_connect_log = 0.0
     last_send = 0.0
     last_print = 0.0
 
@@ -130,40 +110,23 @@ def main() -> None:
                     if not args.no_gui:
                         draw_hand(frame, hand_lms)
 
-            for label in ("Left", "Right"):
-                if label not in centers_by_label:
-                    continue
-                _, _, lms = centers_by_label[label]
-                ori, conf = hand_orientation_upright(lms)
-                if ori == "upright" and conf >= 0.35:
-                    ori_votes[label].append(1)
-                elif ori == "upside_down" and conf >= 0.35:
-                    ori_votes[label].append(-1)
-                else:
-                    ori_votes[label].append(0)
-
-                votes_sum = sum(ori_votes[label])
-                if abs(votes_sum) >= 2:
-                    last_ori[label] = "upright" if votes_sum > 0 else "upside_down"
-                elif len(ori_votes[label]) == ori_votes[label].maxlen:
-                    last_ori[label] = "unknown"
-
-            reversing = False
-            hand_distance = 0.0
-            degree = last_angle_out
+            width_ratio = 0.0
+            angle_out = last_angle_out
 
             if "Left" in centers_by_label and "Right" in centers_by_label:
                 missing_frames = 0
                 left_c = centers_by_label["Left"][1]
                 right_c = centers_by_label["Right"][1]
-                hand_distance = float(np.hypot(right_c[0] - left_c[0], right_c[1] - left_c[1]))
+
+                dist_px_raw = float(np.hypot(right_c[0] - left_c[0], right_c[1] - left_c[1]))
+                dist_filter.append(dist_px_raw)
+                dist_px = float(np.mean(dist_filter))
+                width_ratio = float(np.clip((2.0 * dist_px) / max(float(w), 1.0), 0.0, 2.0))
 
                 raw = angle_deg_from_centers(left_c, right_c)
-
                 if prev_raw is None and not smooth:
                     k = int(round((last_angle_unwrapped - raw) / 360.0))
                     unwrap_offset = 360.0 * k
-
                 if prev_raw is not None:
                     diff = raw - prev_raw
                     if diff > 180.0:
@@ -176,14 +139,8 @@ def main() -> None:
                 smooth.append(unwrapped)
                 filtered = float(np.mean(smooth))
                 last_angle_unwrapped = filtered
-                degree = wrap_deg_180(filtered)
-                last_angle_out = degree
-
-                reversing = (
-                    abs(degree) > 160.0
-                    and last_ori["Left"] == "upright"
-                    and last_ori["Right"] == "upright"
-                )
+                angle_out = wrap_deg_180(filtered)
+                last_angle_out = angle_out
 
                 if not args.no_gui:
                     cv2.line(frame, left_c, right_c, (0, 255, 0), 4, cv2.LINE_AA)
@@ -193,28 +150,28 @@ def main() -> None:
                 missing_frames += 1
                 if missing_frames > 10:
                     smooth.clear()
+                    dist_filter.clear()
                     prev_raw = None
                     unwrap_offset = 0.0
-                    ori_votes["Left"].clear()
-                    ori_votes["Right"].clear()
-                    last_ori["Left"] = "unknown"
-                    last_ori["Right"] = "unknown"
+                width_ratio = 0.0
+                angle_out = last_angle_out
+
+            packet = width_angle_to_packet(width_ratio, angle_out)
 
             now = time.time()
-
             if sock is None and (now - last_connect_try) >= 1.0:
                 last_connect_try = now
                 sock = connect_tcp(args.host, args.port, args.connect_timeout)
                 if sock is not None:
                     print(f"Connected to {args.host}:{args.port}")
+                elif (now - last_connect_log) >= 2.0:
+                    print(f"Retrying connection to {args.host}:{args.port} ...")
+                    last_connect_log = now
 
             if (now - last_send) * 1000.0 >= args.send_ms:
-                transformed = transform_signals(reversing, degree, hand_distance)
-                payload = build_payload(transformed)
                 if sock is not None:
                     try:
-                        if payload:
-                            sock.sendall(payload)
+                        sock.sendall(packet.encode("ascii"))
                     except OSError:
                         try:
                             sock.close()
@@ -224,9 +181,10 @@ def main() -> None:
                 last_send = now
 
             if args.no_gui:
-                if (now - last_print) > 0.25:
+                if (now - last_print) >= 0.1:
+                    status = "CONNECTED" if sock is not None else "DISCONNECTED"
                     print(
-                        f"reversing={reversing} degree={degree:.1f} hand_distance={hand_distance:.1f}"
+                        f"status={status} width={width_ratio:.2f} angle={angle_out:.1f} packet={packet}"
                     )
                     last_print = now
                 continue
@@ -234,7 +192,7 @@ def main() -> None:
             status = "CONNECTED" if sock is not None else "DISCONNECTED"
             cv2.putText(
                 frame,
-                f"reversing {reversing} | deg {degree:.1f} | dist {hand_distance:.1f}",
+                f"w {width_ratio:.2f}x | deg {angle_out:.1f} | pkt {packet}",
                 (10, 32),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.75,
@@ -244,7 +202,7 @@ def main() -> None:
             )
             cv2.putText(
                 frame,
-                f"ESP {args.host}:{args.port} [{status}]  q quit",
+                f"ESP {args.host}:{args.port} [{status}] send {args.send_ms}ms | q quit",
                 (10, frame.shape[0] - 12),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -253,7 +211,7 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("Gesture -> ESP", frame)
+            cv2.imshow("Gesture -> ESP Packets", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:

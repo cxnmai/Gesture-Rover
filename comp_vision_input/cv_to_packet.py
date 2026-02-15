@@ -7,6 +7,7 @@ MAX_WIDTH_SPEED = 1.7
 MAX_PWM = 255
 MAX_STEER_DEG = 180.0
 PIVOT_TURN_FLOOR = 0.35
+TURN_DEADBAND_DEG = 8.0
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -21,6 +22,8 @@ def normalize_speed(width_x: float) -> float:
 
 
 def normalize_turn(angle_deg: float) -> float:
+    if abs(angle_deg) < TURN_DEADBAND_DEG:
+        return 0.0
     return clamp(angle_deg / MAX_STEER_DEG, -1.0, 1.0)
 
 
